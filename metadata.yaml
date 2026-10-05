@@ -1,0 +1,9 @@
+homepage: "https://www.ga4support.nl"
+documentation: "https://cmp.ga4support.nl/gtm-template#consent-state"
+versions:
+  # Newest first. `sha` is a commit hash in the public GitHub repository that holds
+  # template.tpl — not a hash from our own working repository. Fill it in only after
+  # the file has been pushed there, otherwise the gallery points at a commit that
+  # does not exist.
+  - sha: PLACEHOLDER_SHA_INITIAL_RELEASE
+    changeNotes: Initial release.
