@@ -86,54 +86,57 @@ ___SANDBOXED_JS_FOR_WEB_TEMPLATE___
 // consent_update_complete; those are the right source for a *trigger*, and need
 // no template at all.
 //
-// INVARIANT: only a real boolean true is consent. Everything else is "no".
-// A stored choice written by an older banner version, by another script, or by a
-// tampered browser can hold strings instead of booleans, and every non-empty
-// string is truthy in JavaScript -- "0" and "false" included. Comparing with
-// === true is what keeps a visitor from being granted a permission they never
-// gave. The banner itself was fixed for exactly this.
+// Why a text match instead of JSON.parse: the sandbox has no try/catch, so a
+// cookie this template cannot parse would take the variable down on a real
+// visitor's page. The documentation says JSON.parse returns undefined on
+// malformed input, but the Template Editor throws on it -- and a template must
+// not depend on which of those is right. A text match cannot throw.
+//
+// It also makes the central rule structural instead of a comparison: consent is
+// the literal "<category>":true, so a stored value holding the STRING "true"
+// reads as "analytics":"true" and simply does not match. That matters, because
+// every non-empty string is truthy in JavaScript -- "0" and "false" included --
+// and a lenient check would hand out permissions the visitor never gave. The
+// banner itself was fixed for exactly this.
+//
+// What this does depend on: the banner writes the cookie with JSON.stringify, so
+// there is no whitespace between key and value. Anything this template cannot
+// recognise counts as no consent, which is the safe direction.
 
 const getCookieValues = require('getCookieValues');
 const queryPermission = require('queryPermission');
-const JSON = require('JSON');
 
 const COOKIE_NAME = 'ccb_consent';
 const CATEGORIES = ['necessary', 'functional', 'analytics', 'marketing', 'uncategorized'];
 
-function readCategories() {
+function storedChoice() {
   if (!queryPermission('get_cookies', COOKIE_NAME)) {
-    return undefined;
+    return '';
   }
   const values = getCookieValues(COOKIE_NAME);
-  if (!values || values.length === 0) {
-    return undefined;
+  if (!values || values.length === 0 || !values[0]) {
+    return '';
   }
-  // In the sandbox JSON.parse returns undefined on malformed input; it does not throw.
-  const stored = JSON.parse(values[0]);
-  if (!stored || !stored.cats) {
-    return undefined;
-  }
-  return stored.cats;
+  return values[0];
 }
 
-const cats = readCategories();
+function allows(stored, category) {
+  return stored.indexOf('"' + category + '":true') > -1;
+}
+
+const stored = storedChoice();
 
 if (data.output === 'pipe') {
   let allowed = '|';
-  if (cats) {
-    for (let i = 0; i < CATEGORIES.length; i++) {
-      if (cats[CATEGORIES[i]] === true) {
-        allowed = allowed + CATEGORIES[i] + '|';
-      }
+  for (let i = 0; i < CATEGORIES.length; i++) {
+    if (allows(stored, CATEGORIES[i])) {
+      allowed = allowed + CATEGORIES[i] + '|';
     }
   }
   return allowed;
 }
 
-if (cats && cats[data.output] === true) {
-  return 'granted';
-}
-return 'denied';
+return allows(stored, data.output) ? 'granted' : 'denied';
 
 
 ___WEB_PERMISSIONS___
@@ -242,6 +245,8 @@ scenarios:
     // Every non-empty string is truthy in JavaScript, so "0" and "false" would both
     // pass a !! check. A stored choice from an older version, another script or a
     // tampered browser can hold strings, and none of them may grant permission.
+    // A string value reads as "analytics":"true" and does not match the literal
+    // "analytics":true, so the rule holds by construction here.
     mock('getCookieValues', function () {
       return ['{"v":2,"cats":{"analytics":"true","marketing":"0","functional":"false"},"ts":1700000000000}'];
     });
@@ -252,10 +257,41 @@ scenarios:
     assertThat(runCode({ output: 'pipe' })).isEqualTo('|');
 - name: Damaged cookie content returns denied instead of failing
   code: |-
+    // This is the case that brought the variable down while it still used
+    // JSON.parse: the sandbox has no try/catch, so an unparseable cookie ended the
+    // whole evaluation. A text match has nothing to fail on.
     mock('getCookieValues', function () { return ['not json at all']; });
 
     assertThat(runCode({ output: 'analytics' })).isEqualTo('denied');
     assertThat(runCode({ output: 'pipe' })).isEqualTo('|');
+- name: A truncated cookie returns denied instead of failing
+  code: |-
+    mock('getCookieValues', function () { return ['{"v":2,"cats":{"analytics":tr']; });
+
+    assertThat(runCode({ output: 'analytics' })).isEqualTo('denied');
+    assertThat(runCode({ output: 'pipe' })).isEqualTo('|');
+- name: An unrecognised layout counts as no consent, never as consent
+  code: |-
+    // The banner writes the cookie with JSON.stringify, so there is no whitespace
+    // between key and value. Should a stored choice ever arrive in another shape,
+    // this template must fail towards denied -- never towards granted.
+    mock('getCookieValues', function () {
+      return ['{"v":2,"cats":{"analytics": true, "marketing": true}}'];
+    });
+
+    assertThat(runCode({ output: 'analytics' })).isEqualTo('denied');
+    assertThat(runCode({ output: 'pipe' })).isEqualTo('|');
+- name: The version field is not a gate - a later version still reads
+  code: |-
+    // Matching on the category alone keeps installed copies working when the
+    // banner moves to a new cookie version, as long as the categories keep their
+    // names. Gating on "v":2 would block every visitor the day that changes.
+    mock('getCookieValues', function () {
+      return ['{"v":3,"cats":{"necessary":true,"analytics":true},"ts":1700000000000}'];
+    });
+
+    assertThat(runCode({ output: 'analytics' })).isEqualTo('granted');
+    assertThat(runCode({ output: 'pipe' })).isEqualTo('|necessary|analytics|');
 - name: A stored value without a choice object returns denied
   code: |-
     mock('getCookieValues', function () { return ['{"v":2,"ts":1700000000000}']; });
@@ -277,8 +313,12 @@ ___NOTES___
 
 Companion to the GA4 Support Cookie Banner tag template. The banner writes the
 visitor's choice to the ccb_consent cookie as {"v":2,"cats":{...},"ts":...}; this
-variable reads it back.
+variable reads it back with a text match rather than JSON.parse, because the
+sandbox has no try/catch and a cookie that cannot be parsed would otherwise take
+the variable down on a real visitor's page.
 
-Publishing this template freezes that cookie format as a public contract. The "v"
-field is the way out: keep parsing v2 forever and handle a future v3 alongside it,
-rather than changing what v2 means.
+That match depends on the cookie being written by JSON.stringify, which puts no
+whitespace between key and value. It deliberately does not look at the version
+field: matching the category alone keeps installed copies working when the cookie
+moves to a new version, as long as the category names stay. Anything this template
+does not recognise counts as no consent.
